@@ -127,7 +127,6 @@ class StreamPublisher(QWidget):
         self.log.append(txt)
 
     def start_stream(self):
-        mode = self.source_cb.currentText()
         proto = self.proto_cb.currentText()
         url = self.url_edit.text().strip()
         if not url:
@@ -135,58 +134,53 @@ class StreamPublisher(QWidget):
             return
 
         if proto in ("RTMP", "RTSP"):
-            # Build ffmpeg command for RTMP/RTSP
-            if mode == "File":
-                src = self.file_edit.text().strip()
-                input_args = ["-re", "-i", src]
-            elif mode == "Screen":
-                input_args = ["-f", "x11grab", "-i", ":0.0"]
-            else:
-                input_args = ["-f", "v4l2", "-i", "/dev/video0"]
-
-            args = ["ffmpeg"] + input_args
-            if self.transcode_cb.isChecked():
-                args += ["-c:v", "libx264", "-b:v", self.bitrate_edit.text(), "-s", self.res_edit.text(),
-                         "-c:a", "aac", "-b:a", "128k"]
-                filters = []
-                txt = self.text_overlay.text().strip()
-                if txt:
-                    filters.append(f"drawtext=text='{txt}':fontcolor=white:fontsize=24:x=10:y=10")
-                img = self.img_overlay.text().strip()
-                if img and os.path.exists(img):
-                    filters.append(f"movie={img}[logo];[in][logo]overlay=W-w-10:H-h-10[out]")
-                if filters:
-                    args += ["-vf", ','.join(filters)]
-            else:
-                args += ["-c", "copy"]
-
-            fmt = "flv" if proto == "RTMP" else "rtsp"
-            args += ["-f", fmt, url]
-            self.log_append(f"▶️ Running: {' '.join(args)}")
-            def run_ffmpeg():
-                self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                for line in self.proc.stdout:
-                    self.log_append(line.strip())
-            threading.Thread(target=run_ffmpeg, daemon=True).start()
-
+            # RTMP/RTSP unchanged
+            self._start_ffmpeg_stream()
         else:
-            # WHIP with aiortc + ffmpeg-based transcode
+            # WHIP via aiortc
             self.log_append("▶️ Khởi tạo WHIP streaming…")
-            def run_whip():
-                asyncio.run(self._whip_publish(mode, url))
-            threading.Thread(target=run_whip, daemon=True).start()
+            threading.Thread(target=lambda: asyncio.run(self._whip_publish(url)), daemon=True).start()
 
-    async def _whip_publish(self, mode, whip_url):
-        # Build MediaPlayer with optional transcode/filter options
+    def _start_ffmpeg_stream(self):
+        mode = self.source_cb.currentText()
+        if mode == "File":
+            input_args = ["-re", "-i", self.file_edit.text().strip()]
+        elif mode == "Screen":
+            input_args = ["-f", "x11grab", "-i", ":0.0"]
+        else:
+            input_args = ["-f", "v4l2", "-i", "/dev/video0"]
+
+        args = ["ffmpeg"] + input_args
+        if self.transcode_cb.isChecked():
+            args += ["-c:v", "libx264", "-b:v", self.bitrate_edit.text(), "-s", self.res_edit.text(),
+                     "-c:a", "aac", "-b:a", "128k"]
+            filters = []
+            txt = self.text_overlay.text().strip()
+            if txt:
+                filters.append(f"drawtext=text='{txt}':fontcolor=white:fontsize=24:x=10:y=10")
+            img = self.img_overlay.text().strip()
+            if img and os.path.exists(img):
+                filters.append(f"movie={img}[logo];[in][logo]overlay=W-w-10:H-h-10[out]")
+            if filters:
+                args += ["-vf", ','.join(filters)]
+        else:
+            args += ["-c", "copy"]
+
+        fmt = "flv" if self.proto_cb.currentText() == "RTMP" else "rtsp"
+        args += ["-f", fmt, self.url_edit.text().strip()]
+        self.log_append(f"▶️ Running: {' '.join(args)}")
+        def run_ffmpeg():
+            self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in self.proc.stdout:
+                self.log_append(line.strip())
+        threading.Thread(target=run_ffmpeg, daemon=True).start()
+
+    async def _whip_publish(self, whip_url):
+        # prepare options
         options = {}
         if self.transcode_cb.isChecked():
-            options.update({
-                '-s': self.res_edit.text(),
-                '-b:v': self.bitrate_edit.text(),
-                '-c:v': 'libx264',
-                '-c:a': 'aac',
-                '-b:a': '128k'
-            })
+            options.update({'-s': self.res_edit.text(), '-b:v': self.bitrate_edit.text(),
+                            '-c:v': 'libx264', '-c:a': 'aac', '-b:a': '128k'})
             filters = []
             txt = self.text_overlay.text().strip()
             if txt:
@@ -197,14 +191,13 @@ class StreamPublisher(QWidget):
             if filters:
                 options['-vf'] = ','.join(filters)
 
-        if mode == "File":
+        # choose source
+        if self.source_cb.currentText() == "File":
             player = MediaPlayer(self.file_edit.text().strip(), options=options or None)
-        elif mode == "Screen":
-            opts = {'framerate': '30'} | (options or {})
-            player = MediaPlayer(':0.0', format='x11grab', options=opts)
+        elif self.source_cb.currentText() == "Screen":
+            player = MediaPlayer(':0.0', format='x11grab', options={'framerate':'30', **options})
         else:
-            opts = {'framerate': '30'} | (options or {})
-            player = MediaPlayer('/dev/video0', format='v4l2', options=opts)
+            player = MediaPlayer('/dev/video0', format='v4l2', options={'framerate':'30', **options})
 
         pc = RTCPeerConnection()
         if player.audio:
@@ -212,23 +205,41 @@ class StreamPublisher(QWidget):
         if player.video:
             pc.addTrack(player.video)
 
-        self.log_append("[WHIP] Tạo offer…")
+        self.log_append("[WHIP] Tạo offer và gathering ICE…")
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
 
-        self.log_append("[WHIP] Gửi offer tới server…")
-        headers = {"Content-Type": "application/sdp"}
+        # wait ICE gathering complete
+        gather_complete = asyncio.Event()
+        @pc.on('icegatheringstatechange')
+        def on_state_change():
+            if pc.iceGatheringState == 'complete':
+                gather_complete.set()
+        await gather_complete.wait()
+
+        # send SDP to server
+        self.log_append("[WHIP] Gửi SDP tới server…")
+        headers = {'Content-Type':'application/sdp'}
         resp = requests.post(whip_url, data=pc.localDescription.sdp, headers=headers, verify=False)
-        if resp.status_code not in (200, 201):
-            self.log_append(f"[WHIP] Lỗi HTTP {resp.status_code}")
+        if resp.status_code not in (200,201):
+            self.log_append(f"[WHIP] Lỗi HTTP {resp.status_code}: {resp.text}")
             return
 
-        answer = RTCSessionDescription(sdp=resp.text, type="answer")
+        # read Location header for session
+        location = resp.headers.get('Location')
+        self.log_append(f"[WHIP] Session endpoint: {location}")
+
+        answer = RTCSessionDescription(sdp=resp.text, type='answer')
         await pc.setRemoteDescription(answer)
-        self.log_append("[WHIP] Streaming bắt đầu. Nhấn Stop để kết thúc.")
-        # Giữ kết nối
-        while pc.connectionState != 'closed':
-            await asyncio.sleep(1)
+        self.log_append("[WHIP] Streaming đã bắt đầu. Nhấn Stop.")
+
+        # keep alive until closed
+        try:
+            while pc.connectionState != 'closed':
+                await asyncio.sleep(1)
+        finally:
+            if location:
+                requests.delete(location)
 
     def stop_stream(self):
         if self.proc and self.proc.poll() is None:
@@ -237,9 +248,9 @@ class StreamPublisher(QWidget):
         else:
             self.log_append("🛑 Không có tiến trình ffmpeg đang chạy.")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     app = QApplication(sys.argv)
     w = StreamPublisher()
-    w.resize(900, 700)
+    w.resize(900,700)
     w.show()
     sys.exit(app.exec_())
