@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, subprocess, threading, asyncio, requests, os
+import sys, subprocess, threading, asyncio, requests, os, stat
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLineEdit, QPushButton,
     QTextEdit, QVBoxLayout, QHBoxLayout,
@@ -7,6 +7,25 @@ from PyQt5.QtWidgets import (
 )
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer
+
+# Ensure XDG_RUNTIME_DIR has correct permissions (0700)
+def _fix_runtime_dir():
+    runtime = os.environ.get('XDG_RUNTIME_DIR')
+    if runtime and os.path.isdir(runtime):
+        mode = stat.S_IMODE(os.stat(runtime).st_mode)
+        if mode != 0o700:
+            fallback = os.path.expanduser('~/.cache/xdg_runtime')
+            os.makedirs(fallback, exist_ok=True)
+            os.chmod(fallback, 0o700)
+            os.environ['XDG_RUNTIME_DIR'] = fallback
+    else:
+        # create default if not set
+        fallback = os.path.expanduser('~/.cache/xdg_runtime')
+        os.makedirs(fallback, exist_ok=True)
+        os.chmod(fallback, 0o700)
+        os.environ['XDG_RUNTIME_DIR'] = fallback
+
+_fix_runtime_dir()
 
 class StreamPublisher(QWidget):
     def __init__(self):
@@ -134,10 +153,8 @@ class StreamPublisher(QWidget):
             return
 
         if proto in ("RTMP", "RTSP"):
-            # RTMP/RTSP unchanged
             self._start_ffmpeg_stream()
         else:
-            # WHIP via aiortc
             self.log_append("▶️ Khởi tạo WHIP streaming…")
             threading.Thread(target=lambda: asyncio.run(self._whip_publish(url)), daemon=True).start()
 
@@ -176,7 +193,6 @@ class StreamPublisher(QWidget):
         threading.Thread(target=run_ffmpeg, daemon=True).start()
 
     async def _whip_publish(self, whip_url):
-        # prepare options
         options = {}
         if self.transcode_cb.isChecked():
             options.update({'-s': self.res_edit.text(), '-b:v': self.bitrate_edit.text(),
@@ -191,7 +207,6 @@ class StreamPublisher(QWidget):
             if filters:
                 options['-vf'] = ','.join(filters)
 
-        # choose source
         if self.source_cb.currentText() == "File":
             player = MediaPlayer(self.file_edit.text().strip(), options=options or None)
         elif self.source_cb.currentText() == "Screen":
@@ -209,7 +224,6 @@ class StreamPublisher(QWidget):
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
 
-        # wait ICE gathering complete
         gather_complete = asyncio.Event()
         @pc.on('icegatheringstatechange')
         def on_state_change():
@@ -217,7 +231,6 @@ class StreamPublisher(QWidget):
                 gather_complete.set()
         await gather_complete.wait()
 
-        # send SDP to server
         self.log_append("[WHIP] Gửi SDP tới server…")
         headers = {'Content-Type':'application/sdp'}
         resp = requests.post(whip_url, data=pc.localDescription.sdp, headers=headers, verify=False)
@@ -225,7 +238,6 @@ class StreamPublisher(QWidget):
             self.log_append(f"[WHIP] Lỗi HTTP {resp.status_code}: {resp.text}")
             return
 
-        # read Location header for session
         location = resp.headers.get('Location')
         self.log_append(f"[WHIP] Session endpoint: {location}")
 
@@ -233,7 +245,6 @@ class StreamPublisher(QWidget):
         await pc.setRemoteDescription(answer)
         self.log_append("[WHIP] Streaming đã bắt đầu. Nhấn Stop.")
 
-        # keep alive until closed
         try:
             while pc.connectionState != 'closed':
                 await asyncio.sleep(1)
